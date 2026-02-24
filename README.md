@@ -1,5 +1,7 @@
 # @$©!! (Semantic Letters + Pixel Edges + Edge Overlay)
 
+![](assets/Cover_1.png)
+
 A desktop app called @$©!! (ASCII) that converts images into **ASCII art** and **semantic letter-filled renders** (objects filled with characters from their label or a phrase you choose), with **pixelated edge detection** and an **edge overlay** mode.
 
 ---
