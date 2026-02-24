@@ -27,11 +27,12 @@ def set_windows_app_user_model_id(app_id: str):
             pass
 
 def load_app_icon() -> QtGui.QIcon:
-    png = resource_path(os.path.join("assets", "app2_white.png"))
     ico = resource_path(os.path.join("assets", "app2_white.ico"))
-
-    if os.path.exists(png):
-        return QtGui.QIcon(png)
     if os.path.exists(ico):
         return QtGui.QIcon(ico)
+
+    png = resource_path(os.path.join("assets", "app2_white.png"))
+    if os.path.exists(png):
+        return QtGui.QIcon(png)
+
     return QtGui.QIcon()
