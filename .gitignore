@@ -22,3 +22,7 @@ Thumbs.db
 
 # Optional: local env vars / secrets
 .env
+
+# Assets
+*.ai
+*.psd

@@ -7,7 +7,7 @@ block_cipher = None
 
 APP_NAME = "@$©!!"
 ENTRY_SCRIPT = os.path.join("app", "main.py")
-ICON_PATH = os.path.join("assets", "app.ico")
+ICON_PATH = os.path.join("assets", "app2_white.ico")
 
 def has_pkg(name: str) -> bool:
     try:
