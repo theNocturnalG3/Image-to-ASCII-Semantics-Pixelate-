@@ -51,10 +51,9 @@ Built as a GUI desktop application (Python).
 
 ## Demo / Screenshots
 
-![UI](assets/screenshot_ui.png)
-![Semantic Letters](assets/screenshot_semantic.png)
-![Pixel Edges](assets/screenshot_edges.png)
-![Logo](assets/app2_white.png)
+![UI](examples/screenshot_ui.png)
+![Semantic Letters](examples/BOA_humanx0110.png)
+![Pixel Edges](examples/BOA_3.png)
 
 ---
 
