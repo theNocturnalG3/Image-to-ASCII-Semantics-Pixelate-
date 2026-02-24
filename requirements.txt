@@ -1,0 +1,10 @@
+PySide6
+Pillow
+numpy
+pyinstaller
+pyinstaller-hooks-contrib
+huggingface_hub
+transformers
+tokenizers
+safetensors
+torch

@@ -1,0 +1,1630 @@
+import os
+import json
+import traceback
+from dataclasses import dataclass
+from typing import Optional, Tuple, Dict, List, Set
+from app.utils.fonts import is_monospace_font_file
+
+import numpy as np
+from PIL import Image
+
+from PySide6 import QtCore, QtGui, QtWidgets
+
+from app.utils.fonts import list_windows_font_files, safe_load_pil_font, measure_char_cell
+from app.render.adjustments import apply_adjustments
+from app.render.ascii import PRESET_CHARSETS, make_ascii_lines
+from app.render.color import build_color_map
+from app.render.edges import make_pixel_edge_mask, edge_mask_to_lines, overlay_edges_on_lines
+from app.render.semantic import SEMANTIC_AVAILABLE, compute_seg_small, seg_to_ids_grid
+from app.render.rendering import render_lines_to_rgba, pil_to_qimage
+from app.render.export import svg_embed_png, svg_text_export
+
+
+CONTENT_MODES = ["ASCII", "Semantic Letters", "Pixel Edges", "Edge Overlay"]
+FILL_STYLES = ["Jumble", "Cycle"]
+COLOR_MODES = ["Mono", "Color (Direct)", "Color (K-means)"]
+EDGE_BG_MODES = ["Dark", "White"]
+EDGE_FG_MODES = ["White", "Black"]
+
+PROCESS_MAX_SIDE = 1600
+FAST_DEBOUNCE_MS = 80
+KMEANS_DEBOUNCE_MS = 220
+DEFAULT_PREVIEW_CAP = 160
+
+
+def downscale_for_processing(img: Image.Image, max_side: int) -> Image.Image:
+    w, h = img.size
+    m = max(w, h)
+    if m <= max_side:
+        return img
+    scale = max_side / m
+    return img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+
+
+# ----------------------------
+# UI Widgets
+# ----------------------------
+class ImageView(QtWidgets.QLabel):
+    def __init__(self):
+        super().__init__()
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        self.setMinimumSize(320, 220)
+        self._pixmap: Optional[QtGui.QPixmap] = None
+        self.setStyleSheet("QLabel { background: #0F0F12; border-radius: 10px; border: 1px solid #2B2B30; }")
+
+    def set_image(self, qimage: Optional[QtGui.QImage]):
+        self._pixmap = QtGui.QPixmap.fromImage(qimage) if qimage is not None else None
+        self._update_scaled()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent):
+        super().resizeEvent(event)
+        self._update_scaled()
+
+    def _update_scaled(self):
+        if self._pixmap is None:
+            self.setPixmap(QtGui.QPixmap())
+            return
+        scaled = self._pixmap.scaled(self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        self.setPixmap(scaled)
+
+
+class DoubleClickResetSlider(QtWidgets.QSlider):
+    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent):
+        self.setValue(0)
+        event.accept()
+
+
+# ----------------------------
+# Render worker
+# ----------------------------
+@dataclass
+class RenderParams:
+    content_mode: str
+    fill_style: str
+    seed: int
+
+    width_chars: int
+    use_preview_cap: bool
+    preview_cap: int
+
+    invert: bool
+    charset: str
+
+    brightness: int
+    contrast: int
+    ambiance: int
+    saturation: int
+    highlights: int
+    shadows: int
+
+    font_path: str
+    font_size: int
+    ttc_index: int
+
+    color_mode: str
+    k: int
+    allow_kmeans: bool
+
+    transparent_bg: bool
+
+    seg_small: Optional[np.ndarray]
+    seg_lut: Optional[List[str]]
+
+    label_map: Dict[str, str]
+    hidden_labels: List[str]
+
+    edge_threshold: int
+    edge_pixel_size: int
+    edge_thickness: int
+    edge_invert: bool
+    edge_char: str
+    edge_bg: str
+    edge_fg: str
+
+
+@dataclass
+class RenderResult:
+    content_mode: str
+    preview_qimage: QtGui.QImage
+    render_qimage: QtGui.QImage
+    lines: List[str]
+    color_map: Optional[np.ndarray]
+    font_path: str
+    font_size: int
+    ttc_index: int
+    transparent_bg: bool
+    seg_small: Optional[np.ndarray]
+    seg_lut: Optional[List[str]]
+
+
+class WorkerSignals(QtCore.QObject):
+    result = QtCore.Signal(int, object)
+    error = QtCore.Signal(int, str)
+
+
+class RenderWorker(QtCore.QRunnable):
+    def __init__(self, request_id: int, base_img: Image.Image, params: RenderParams):
+        super().__init__()
+        self.request_id = request_id
+        self.base_img = base_img
+        self.params = params
+        self.signals = WorkerSignals()
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            font = safe_load_pil_font(self.params.font_path, self.params.font_size, self.params.ttc_index)
+            char_w, char_h = measure_char_cell(font)
+
+            adjusted = apply_adjustments(
+                self.base_img,
+                self.params.brightness, self.params.contrast, self.params.ambiance,
+                self.params.saturation, self.params.highlights, self.params.shadows
+            )
+
+            out_w = int(self.params.width_chars)
+            if self.params.use_preview_cap and self.params.preview_cap > 0:
+                out_w = min(out_w, int(self.params.preview_cap))
+
+            iw, ih = adjusted.size
+            out_h = max(1, int(round((ih / iw) * out_w * (char_w / char_h))))
+            resized_rgb = adjusted.resize((out_w, out_h), Image.Resampling.BILINEAR)
+
+            mode = self.params.content_mode
+            bg_rgb = (15, 15, 15)
+            fg_rgb = (230, 230, 230)
+            final_color_map = None
+
+            # ---------------- ASCII ----------------
+            if mode == "ASCII":
+                lines, rgb_r, _ = make_ascii_lines(
+                    adjusted, out_w, self.params.charset, self.params.invert, char_w, char_h
+                )
+                color_map = None
+                if self.params.color_mode != "Mono":
+                    if self.params.color_mode == "Color (Direct)":
+                        color_map = build_color_map(rgb_r, "Color (Direct)", self.params.k)
+                    else:
+                        if self.params.allow_kmeans:
+                            color_map = build_color_map(rgb_r, "Color (K-means)", self.params.k)
+                        else:
+                            color_map = build_color_map(rgb_r, "Color (Direct)", self.params.k)
+
+                render_pil = render_lines_to_rgba(lines, font, color_map, self.params.transparent_bg, bg_rgb, fg_rgb)
+                final_color_map = color_map
+
+            # ---------------- Pixel Edges ----------------
+            elif mode == "Pixel Edges":
+                mask = make_pixel_edge_mask(
+                    adjusted, out_w, out_h,
+                    pixel_size=self.params.edge_pixel_size,
+                    threshold=self.params.edge_threshold,
+                    thickness=self.params.edge_thickness,
+                    invert=self.params.edge_invert
+                )
+                lines = edge_mask_to_lines(mask, self.params.edge_char)
+                fg_rgb = (0, 0, 0) if self.params.edge_fg == "Black" else (235, 235, 235)
+                bg_rgb = (255, 255, 255) if self.params.edge_bg == "White" else (15, 15, 15)
+                render_pil = render_lines_to_rgba(lines, font, None, self.params.transparent_bg, bg_rgb, fg_rgb)
+                final_color_map = None
+
+            # ---------------- Edge Overlay ----------------
+            elif mode == "Edge Overlay":
+                base_lines, rgb_r, _ = make_ascii_lines(
+                    adjusted, out_w, self.params.charset, self.params.invert, char_w, char_h
+                )
+
+                if self.params.color_mode == "Mono":
+                    base_cm = np.zeros((len(base_lines), max(len(l) for l in base_lines), 3), dtype=np.uint8)
+                    base_cm[:, :, :] = np.array([230, 230, 230], dtype=np.uint8)
+                else:
+                    if self.params.color_mode == "Color (Direct)":
+                        base_cm = build_color_map(rgb_r, "Color (Direct)", self.params.k)
+                    else:
+                        if self.params.allow_kmeans:
+                            base_cm = build_color_map(rgb_r, "Color (K-means)", self.params.k)
+                        else:
+                            base_cm = build_color_map(rgb_r, "Color (Direct)", self.params.k)
+
+                mask = make_pixel_edge_mask(
+                    adjusted, out_w, len(base_lines),
+                    pixel_size=self.params.edge_pixel_size,
+                    threshold=self.params.edge_threshold,
+                    thickness=self.params.edge_thickness,
+                    invert=self.params.edge_invert
+                )
+
+                lines = overlay_edges_on_lines(base_lines, mask, self.params.edge_char)
+                edge_rgb = (0, 0, 0) if self.params.edge_fg == "Black" else (235, 235, 235)
+                m = np.asarray(mask.resize((base_cm.shape[1], base_cm.shape[0]), Image.Resampling.NEAREST), dtype=np.uint8)
+                cm = base_cm.copy()
+                cm[m > 0] = np.array(edge_rgb, dtype=np.uint8)
+
+                render_pil = render_lines_to_rgba(lines, font, cm, self.params.transparent_bg, bg_rgb, fg_rgb)
+                final_color_map = cm
+
+            # ---------------- Semantic Letters (with label map + hide) ----------------
+            else:
+                if not SEMANTIC_AVAILABLE:
+                    raise RuntimeError("Semantic mode requires torch + transformers.")
+
+                seg_small = self.params.seg_small
+                seg_lut = self.params.seg_lut
+                if seg_small is None or seg_lut is None:
+                    seg_small, seg_lut = compute_seg_small(self.base_img)
+
+                ids_grid = seg_to_ids_grid(seg_small, out_w, out_h)
+                max_id = int(ids_grid.max())
+                if max_id >= len(seg_lut):
+                    seg_lut = seg_lut + ["object"] * (max_id + 1 - len(seg_lut))
+
+                hidden_set = set([s.strip().lower() for s in self.params.hidden_labels if s])
+
+                def phrase_to_char_pool(phrase: str) -> List[str]:
+                    phrase = (phrase or "").strip()
+                    if not phrase:
+                        return ["o"]
+                    if "," in phrase:
+                        parts = [p.strip() for p in phrase.split(",") if p.strip()]
+                    else:
+                        parts = [p for p in phrase.split() if p]
+                    if len(parts) >= 2 and all(len(p) <= 3 for p in parts):
+                        seq = []
+                        for p in parts:
+                            ch = p[0]
+                            if ch == "_":
+                                ch = " "
+                            seq.append(ch)
+                        return seq if seq else ["o"]
+                    s = phrase.replace(" ", "")
+                    return [c for c in s] if s else ["o"]
+
+                def _splitmix64(z: int) -> int:
+                    z = (z + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+                    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9 & 0xFFFFFFFFFFFFFFFF
+                    z = (z ^ (z >> 27)) * 0x94D049BB133111EB & 0xFFFFFFFFFFFFFFFF
+                    z = z ^ (z >> 31)
+                    return z & 0xFFFFFFFFFFFFFFFF
+
+                def pick_char_jumble(pool: List[str], x: int, y: int, cls_id: int, seed: int) -> str:
+                    if not pool:
+                        return "o"
+                    z = seed & 0xFFFFFFFFFFFFFFFF
+                    z ^= (x * 0x1F123BB5) & 0xFFFFFFFFFFFFFFFF
+                    z ^= (y * 0x9E3779B1) & 0xFFFFFFFFFFFFFFFF
+                    z ^= (cls_id * 0xC2B2AE35) & 0xFFFFFFFFFFFFFFFF
+                    h = _splitmix64(z)
+                    return pool[h % len(pool)]
+
+                id_to_pool: Dict[int, List[str]] = {}
+                for cid in np.unique(ids_grid):
+                    lbl = seg_lut[int(cid)].strip().lower()
+                    if lbl in hidden_set:
+                        id_to_pool[int(cid)] = [" "]
+                    else:
+                        phrase = (self.params.label_map.get(lbl, "") or "").strip() or lbl
+                        id_to_pool[int(cid)] = phrase_to_char_pool(phrase)
+
+                seed = int(self.params.seed) & 0xFFFFFFFFFFFFFFFF
+                cycle = (self.params.fill_style == "Cycle")
+
+                lines = []
+                for y in range(out_h):
+                    row = []
+                    row_ids = ids_grid[y]
+                    for x in range(out_w):
+                        cid = int(row_ids[x])
+                        pool = id_to_pool.get(cid) or ["o"]
+                        if cycle:
+                            idx = (x + y * 131 + cid * 17) % len(pool)
+                            ch = pool[idx]
+                        else:
+                            ch = pick_char_jumble(pool, x, y, cid, seed)
+                        row.append(ch[0] if ch else " ")
+                    lines.append("".join(row))
+
+                color_map = None
+                if self.params.color_mode != "Mono":
+                    if self.params.color_mode == "Color (Direct)":
+                        color_map = build_color_map(resized_rgb, "Color (Direct)", self.params.k)
+                    else:
+                        if self.params.allow_kmeans:
+                            color_map = build_color_map(resized_rgb, "Color (K-means)", self.params.k)
+                        else:
+                            color_map = build_color_map(resized_rgb, "Color (Direct)", self.params.k)
+
+                render_pil = render_lines_to_rgba(lines, font, color_map, self.params.transparent_bg, bg_rgb, fg_rgb)
+                final_color_map = color_map
+
+                self.params.seg_small = seg_small
+                self.params.seg_lut = seg_lut
+
+            rr = RenderResult(
+                content_mode=mode,
+                preview_qimage=pil_to_qimage(adjusted),
+                render_qimage=pil_to_qimage(render_pil),
+                lines=lines,
+                color_map=final_color_map,
+                font_path=self.params.font_path,
+                font_size=self.params.font_size,
+                ttc_index=self.params.ttc_index,
+                transparent_bg=self.params.transparent_bg,
+                seg_small=self.params.seg_small,
+                seg_lut=self.params.seg_lut
+            )
+            self.signals.result.emit(self.request_id, rr)
+
+        except Exception:
+            self.signals.error.emit(self.request_id, traceback.format_exc())
+
+
+# ----------------------------
+# Main Window
+# ----------------------------
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("@$©!!")
+        self.resize(1580, 950)
+
+        self.thread_pool = QtCore.QThreadPool.globalInstance()
+        self.thread_pool.setMaxThreadCount(1)
+        self._active_workers: Dict[int, RenderWorker] = {}
+
+        self.base_img: Optional[Image.Image] = None
+        self.last_result: Optional[RenderResult] = None
+
+        self.request_id = 0
+        self.last_applied_id = 0
+
+        self.seg_small: Optional[np.ndarray] = None
+        self.seg_lut: Optional[List[str]] = None
+
+        # ✅ semantics mapping state
+        self.label_map: Dict[str, str] = {}
+        self.hidden_labels: Set[str] = set()
+
+        self.is_dragging = False
+
+        all_fonts = list_windows_font_files()
+        mono_fonts = [(lbl, p) for (lbl, p) in all_fonts if is_monospace_font_file(p, size=16, ttc_index=0)]
+        self.font_files = mono_fonts if mono_fonts else all_fonts  # fallback if detection fails
+        self.font_map: Dict[str, str] = {lbl: p for lbl, p in self.font_files}
+        self._font_family_cache: Dict[str, str] = {}
+        
+        self._warned_nonmono_fonts: Set[str] = set()
+        self._consolas_index: Optional[int] = None
+
+        self.fast_timer = QtCore.QTimer(self)
+        self.fast_timer.setSingleShot(True)
+        self.fast_timer.timeout.connect(self.dispatch_fast)
+
+        self.kmeans_timer = QtCore.QTimer(self)
+        self.kmeans_timer.setSingleShot(True)
+        self.kmeans_timer.timeout.connect(self.dispatch_kmeans)
+
+        self._build_ui()
+        self.set_controls_enabled(False)
+
+    # ----------------------------
+    # Semantics helpers
+    # ----------------------------
+    def _make_hide_item(self, hidden: bool) -> QtWidgets.QTableWidgetItem:
+        it = QtWidgets.QTableWidgetItem("")
+        it.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsSelectable)
+        it.setCheckState(QtCore.Qt.Checked if hidden else QtCore.Qt.Unchecked)
+        return it
+
+    def _find_label_row(self, lbl: str) -> Optional[int]:
+        lbl = lbl.strip().lower()
+        for r in range(self.table_sem.rowCount()):
+            it = self.table_sem.item(r, 0)
+            if it and it.text().strip().lower() == lbl:
+                return r
+        return None
+
+    def _refresh_table_from_maps(self):
+        self.table_sem.blockSignals(True)
+        self.table_sem.setRowCount(0)
+        keys = sorted(set(self.label_map.keys()) | set(self.hidden_labels))
+        for lbl in keys:
+            r = self.table_sem.rowCount()
+            self.table_sem.insertRow(r)
+
+            item_lbl = QtWidgets.QTableWidgetItem(lbl)
+            item_lbl.setFlags(item_lbl.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.table_sem.setItem(r, 0, item_lbl)
+
+            self.table_sem.setItem(r, 1, QtWidgets.QTableWidgetItem(self.label_map.get(lbl, "")))
+            self.table_sem.setItem(r, 2, self._make_hide_item(lbl in self.hidden_labels))
+        self.table_sem.blockSignals(False)
+
+    def detect_labels(self):
+        if not SEMANTIC_AVAILABLE:
+            QtWidgets.QMessageBox.information(
+                self, "Semantic not available",
+                "Install:\n\npip install transformers\npip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu"
+            )
+            return
+        if self.base_img is None:
+            return
+
+        self.lbl_sem_status.setText("Detecting labels… (first time may download/load model)")
+        QtWidgets.QApplication.processEvents()
+
+        try:
+            if self.seg_small is None or self.seg_lut is None:
+                self.seg_small, self.seg_lut = compute_seg_small(self.base_img)
+
+            flat = self.seg_small.reshape(-1)
+            counts = np.bincount(flat, minlength=max(int(flat.max()) + 1, len(self.seg_lut)))
+            pairs = []
+            for cid, cnt in enumerate(counts):
+                if cnt <= 0:
+                    continue
+                if cid >= len(self.seg_lut):
+                    continue
+                pairs.append((int(cnt), self.seg_lut[cid]))
+            pairs.sort(reverse=True)
+
+            top = []
+            seen = set()
+            for cnt, lbl in pairs:
+                lbl = (lbl or "").strip().lower()
+                if not lbl or lbl in seen:
+                    continue
+                seen.add(lbl)
+                top.append(lbl)
+                if len(top) >= 30:
+                    break
+
+            self.table_sem.blockSignals(True)
+            self.table_sem.setRowCount(0)
+            for lbl in top:
+                r = self.table_sem.rowCount()
+                self.table_sem.insertRow(r)
+
+                item_lbl = QtWidgets.QTableWidgetItem(lbl)
+                item_lbl.setFlags(item_lbl.flags() & ~QtCore.Qt.ItemIsEditable)
+                self.table_sem.setItem(r, 0, item_lbl)
+
+                self.table_sem.setItem(r, 1, QtWidgets.QTableWidgetItem(self.label_map.get(lbl, "")))
+                self.table_sem.setItem(r, 2, self._make_hide_item(lbl in self.hidden_labels))
+            self.table_sem.blockSignals(False)
+
+            self.lbl_sem_status.setText("Labels detected. Edit replacement or tick Hide to delete regions.")
+            self.schedule_fast()
+
+        except Exception:
+            print(traceback.format_exc())
+            self.lbl_sem_status.setText("Error detecting labels (see console).")
+
+    def hide_all_except_selected(self):
+        if self.base_img is None:
+            return
+
+        selected_rows = {idx.row() for idx in self.table_sem.selectionModel().selectedRows()}
+        if not selected_rows:
+            QtWidgets.QMessageBox.information(self, "Select labels", "Select one or more label rows first.")
+            return
+
+        keep = set()
+        for r in selected_rows:
+            it = self.table_sem.item(r, 0)
+            if it:
+                keep.add(it.text().strip().lower())
+
+        all_labels = set()
+        try:
+            if SEMANTIC_AVAILABLE:
+                if self.seg_small is None or self.seg_lut is None:
+                    self.seg_small, self.seg_lut = compute_seg_small(self.base_img)
+                ids = np.unique(self.seg_small.reshape(-1))
+                for cid in ids:
+                    if cid < len(self.seg_lut):
+                        all_labels.add(self.seg_lut[int(cid)].strip().lower())
+        except Exception:
+            pass
+
+        if not all_labels:
+            for r in range(self.table_sem.rowCount()):
+                it = self.table_sem.item(r, 0)
+                if it:
+                    all_labels.add(it.text().strip().lower())
+
+        self.hidden_labels = set(all_labels) - set(keep)
+
+        self.table_sem.blockSignals(True)
+        for r in range(self.table_sem.rowCount()):
+            it = self.table_sem.item(r, 0)
+            if not it:
+                continue
+            lbl = it.text().strip().lower()
+            self.table_sem.setItem(r, 2, self._make_hide_item(lbl in self.hidden_labels))
+        self.table_sem.blockSignals(False)
+
+        self.lbl_sem_status.setText(f"Kept visible: {', '.join(sorted(keep))}")
+        self.schedule_fast()
+
+    def unhide_all(self):
+        self.hidden_labels = set()
+        self.table_sem.blockSignals(True)
+        for r in range(self.table_sem.rowCount()):
+            self.table_sem.setItem(r, 2, self._make_hide_item(False))
+        self.table_sem.blockSignals(False)
+        self.lbl_sem_status.setText("All labels unhidden.")
+        self.schedule_fast()
+
+    def add_update_mapping(self):
+        lbl = (self.edit_add_label.text() or "").strip().lower()
+        phrase = (self.edit_add_phrase.text() or "").strip()
+        hide = bool(self.chk_add_hide.isChecked())
+        if not lbl:
+            return
+
+        if phrase == "":
+            self.label_map.pop(lbl, None)
+        else:
+            self.label_map[lbl] = phrase
+
+        if hide:
+            self.hidden_labels.add(lbl)
+        else:
+            self.hidden_labels.discard(lbl)
+
+        self.table_sem.blockSignals(True)
+        row = self._find_label_row(lbl)
+        if row is None:
+            r = self.table_sem.rowCount()
+            self.table_sem.insertRow(r)
+
+            item_lbl = QtWidgets.QTableWidgetItem(lbl)
+            item_lbl.setFlags(item_lbl.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.table_sem.setItem(r, 0, item_lbl)
+
+            self.table_sem.setItem(r, 1, QtWidgets.QTableWidgetItem(self.label_map.get(lbl, "")))
+            self.table_sem.setItem(r, 2, self._make_hide_item(lbl in self.hidden_labels))
+        else:
+            it_phrase = self.table_sem.item(row, 1)
+            if it_phrase is not None:
+                it_phrase.setText(self.label_map.get(lbl, ""))
+            self.table_sem.setItem(row, 2, self._make_hide_item(lbl in self.hidden_labels))
+        self.table_sem.blockSignals(False)
+
+        self.edit_add_label.setText("")
+        self.edit_add_phrase.setText("")
+        self.chk_add_hide.setChecked(False)
+
+        self.schedule_fast()
+
+    def remove_selected_mappings(self):
+        rows = sorted({idx.row() for idx in self.table_sem.selectionModel().selectedRows()}, reverse=True)
+        if not rows:
+            return
+        self.table_sem.blockSignals(True)
+        for r in rows:
+            lbl_item = self.table_sem.item(r, 0)
+            if lbl_item:
+                lbl = lbl_item.text().strip().lower()
+                self.label_map.pop(lbl, None)
+                self.hidden_labels.discard(lbl)
+            self.table_sem.removeRow(r)
+        self.table_sem.blockSignals(False)
+        self.schedule_fast()
+
+    def on_table_changed(self, item: QtWidgets.QTableWidgetItem):
+        row = item.row()
+        lbl_item = self.table_sem.item(row, 0)
+        if not lbl_item:
+            return
+        lbl = lbl_item.text().strip().lower()
+
+        if item.column() == 1:
+            phrase = (item.text() or "").strip()
+            if phrase == "":
+                self.label_map.pop(lbl, None)
+            else:
+                self.label_map[lbl] = phrase
+            self.schedule_fast()
+            return
+
+        if item.column() == 2:
+            hidden = (item.checkState() == QtCore.Qt.Checked)
+            if hidden:
+                self.hidden_labels.add(lbl)
+            else:
+                self.hidden_labels.discard(lbl)
+            self.schedule_fast()
+            return
+
+    def import_json(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import mappings", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            self.label_map = {}
+            self.hidden_labels = set()
+
+            # supports:
+            # {"tree": "cherry blossom"}  (old)
+            # {"tree": {"phrase":"...", "hide": true}} (new)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    lbl = str(k).strip().lower()
+                    if isinstance(v, dict):
+                        phrase = str(v.get("phrase", "") or "").strip()
+                        hide = bool(v.get("hide", False))
+                    else:
+                        phrase = str(v or "").strip()
+                        hide = False
+
+                    if phrase != "":
+                        self.label_map[lbl] = phrase
+                    if hide:
+                        self.hidden_labels.add(lbl)
+
+            self._refresh_table_from_maps()
+            self.lbl_sem_status.setText(f"Imported {len(set(self.label_map) | self.hidden_labels)} entries.")
+            self.schedule_fast()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Import error", str(e))
+
+    def export_json(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export mappings", "mappings.json", "JSON (*.json)")
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        try:
+            keys = set(self.label_map.keys()) | set(self.hidden_labels)
+            data = {}
+            for lbl in sorted(keys):
+                data[lbl] = {"phrase": self.label_map.get(lbl, ""), "hide": (lbl in self.hidden_labels)}
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.lbl_sem_status.setText(f"Exported {len(data)} entries.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Export error", str(e))
+
+    # ----------------------------
+    # UI Layout
+    # ----------------------------
+    def _build_ui(self):
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        root = QtWidgets.QHBoxLayout(central)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        root.addWidget(splitter)
+
+        # LEFT previews
+        left = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
+        tabs = QtWidgets.QTabWidget()
+        self.image_view = ImageView()
+        self.render_view = ImageView()
+
+        t1 = QtWidgets.QWidget()
+        l1 = QtWidgets.QVBoxLayout(t1)
+        l1.addWidget(self.image_view)
+
+        t2 = QtWidgets.QWidget()
+        l2 = QtWidgets.QVBoxLayout(t2)
+        l2.addWidget(self.render_view)
+
+        tabs.addTab(t1, "Image Preview")
+        tabs.addTab(t2, "Render Preview")
+        left_layout.addWidget(tabs)
+        splitter.addWidget(left)
+
+        # RIGHT controls + optional text
+        right = QtWidgets.QWidget()
+        right.setMinimumWidth(620)
+        right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(10)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+
+        container = QtWidgets.QWidget()
+        self.controls_layout = QtWidgets.QVBoxLayout(container)
+        self.controls_layout.setContentsMargins(0, 0, 0, 0)
+        self.controls_layout.setSpacing(10)
+        scroll.setWidget(container)
+
+        right_layout.addWidget(scroll, stretch=3)
+
+        out_group = QtWidgets.QGroupBox("Text Output (optional)")
+        out_layout = QtWidgets.QVBoxLayout(out_group)
+        row = QtWidgets.QHBoxLayout()
+        self.chk_live_text = QtWidgets.QCheckBox("Live text update (slower)")
+        self.chk_live_text.setChecked(False)
+        row.addWidget(self.chk_live_text)
+
+        btn_copy = QtWidgets.QPushButton("Copy latest text")
+        btn_copy.clicked.connect(self.copy_latest_text)
+        row.addWidget(btn_copy)
+
+        btn_save = QtWidgets.QPushButton("Save latest .txt")
+        btn_save.clicked.connect(self.save_latest_txt)
+        row.addWidget(btn_save)
+
+        row.addStretch(1)
+        out_layout.addLayout(row)
+
+        self.output_text = QtWidgets.QTextEdit()
+        self.output_text.setFont(QtGui.QFont("Consolas", 9))
+        out_layout.addWidget(self.output_text)
+
+        right_layout.addWidget(out_group, stretch=2)
+
+        splitter.addWidget(right)
+        splitter.setSizes([940, 640])
+
+        self.status = QtWidgets.QStatusBar()
+        self.setStatusBar(self.status)
+        self.status.showMessage("Open an image to begin.")
+
+        self._build_groups()
+
+    def _build_groups(self):
+        # File
+        g_file = QtWidgets.QGroupBox("File")
+        h = QtWidgets.QHBoxLayout(g_file)
+
+        btn_open = QtWidgets.QPushButton("Open")
+        btn_open.clicked.connect(self.open_image)
+        h.addWidget(btn_open)
+
+        btn_export_png = QtWidgets.QPushButton("Export PNG")
+        btn_export_png.clicked.connect(self.export_png)
+        h.addWidget(btn_export_png)
+
+        btn_export_svg = QtWidgets.QPushButton("Export SVG…")
+        btn_export_svg.clicked.connect(self.export_svg)
+        h.addWidget(btn_export_svg)
+
+        h.addStretch(1)
+        self.controls_layout.addWidget(g_file)
+
+        # Render settings
+        self.g_render = QtWidgets.QGroupBox("Render Settings")
+        grid = QtWidgets.QGridLayout(self.g_render)
+
+        grid.addWidget(QtWidgets.QLabel("Content"), 0, 0)
+        self.cmb_content = QtWidgets.QComboBox()
+        self.cmb_content.addItems(CONTENT_MODES)
+        self.cmb_content.currentIndexChanged.connect(self.on_content_changed)
+        grid.addWidget(self.cmb_content, 0, 1)
+
+        if not SEMANTIC_AVAILABLE:
+            it = self.cmb_content.model().item(1)  # Semantic Letters
+            if it is not None:
+                it.setEnabled(False)
+
+        grid.addWidget(QtWidgets.QLabel("Fill style (Semantic)"), 0, 2)
+        self.cmb_fill = QtWidgets.QComboBox()
+        self.cmb_fill.addItems(FILL_STYLES)
+        self.cmb_fill.setCurrentText("Jumble")
+        self.cmb_fill.currentIndexChanged.connect(self.schedule_fast)
+        grid.addWidget(self.cmb_fill, 0, 3)
+
+        grid.addWidget(QtWidgets.QLabel("Seed (Semantic)"), 1, 2)
+        self.spin_seed = QtWidgets.QSpinBox()
+        self.spin_seed.setRange(0, 2_000_000_000)
+        self.spin_seed.setValue(1337)
+        self.spin_seed.valueChanged.connect(self.schedule_fast)
+        grid.addWidget(self.spin_seed, 1, 3)
+
+        grid.addWidget(QtWidgets.QLabel("Width (chars)"), 1, 0)
+        self.spin_width = QtWidgets.QSpinBox()
+        self.spin_width.setRange(20, 700)
+        self.spin_width.setValue(200)
+        self.spin_width.valueChanged.connect(self.schedule_fast)
+        grid.addWidget(self.spin_width, 1, 1)
+
+        self.chk_invert = QtWidgets.QCheckBox("Invert (ASCII/Overlay)")
+        self.chk_invert.stateChanged.connect(self.schedule_fast)
+        grid.addWidget(self.chk_invert, 2, 0, 1, 2)
+
+        grid.addWidget(QtWidgets.QLabel("Color"), 2, 2)
+        self.cmb_color = QtWidgets.QComboBox()
+        self.cmb_color.addItems(COLOR_MODES)
+        self.cmb_color.currentIndexChanged.connect(self.schedule_fast)
+        grid.addWidget(self.cmb_color, 2, 3)
+
+        grid.addWidget(QtWidgets.QLabel("K"), 3, 2)
+        self.spin_k = QtWidgets.QSpinBox()
+        self.spin_k.setRange(2, 32)
+        self.spin_k.setValue(8)
+        self.spin_k.valueChanged.connect(self.schedule_fast)
+        grid.addWidget(self.spin_k, 3, 3)
+
+        self.chk_transparent = QtWidgets.QCheckBox("Transparent background")
+        self.chk_transparent.setChecked(False)
+        self.chk_transparent.stateChanged.connect(self.schedule_fast)
+        grid.addWidget(self.chk_transparent, 3, 0, 1, 2)
+
+        self.chk_preview_cap = QtWidgets.QCheckBox("Preview cap while dragging")
+        self.chk_preview_cap.setChecked(True)
+        self.chk_preview_cap.stateChanged.connect(self.schedule_fast)
+        grid.addWidget(self.chk_preview_cap, 4, 0, 1, 2)
+
+        grid.addWidget(QtWidgets.QLabel("Cap (chars)"), 4, 2)
+        self.spin_preview_cap = QtWidgets.QSpinBox()
+        self.spin_preview_cap.setRange(40, 500)
+        self.spin_preview_cap.setValue(DEFAULT_PREVIEW_CAP)
+        self.spin_preview_cap.valueChanged.connect(self.schedule_fast)
+        grid.addWidget(self.spin_preview_cap, 4, 3)
+
+        self.controls_layout.addWidget(self.g_render)
+
+        # Font
+            
+        self.g_font = QtWidgets.QGroupBox("Font")
+        grid = QtWidgets.QGridLayout(self.g_font)
+
+        grid.addWidget(QtWidgets.QLabel("Font (Windows)"), 0, 0)
+        self.cmb_font = QtWidgets.QComboBox()
+
+        if self.font_files:
+            labels = [lbl for lbl, _ in self.font_files]
+            self.cmb_font.addItems(labels)
+
+            labels_lower = [lbl.lower() for lbl in labels]
+            if "consola.ttf" in labels_lower:
+                self._consolas_index = labels_lower.index("consola.ttf")
+                self.cmb_font.setCurrentIndex(self._consolas_index)
+            else:
+                self._consolas_index = 0
+        else:
+            self.cmb_font.addItem("(No fonts found)")
+            self._consolas_index = 0
+
+        # IMPORTANT: connect to our guard handler, not directly to schedule_fast
+        self.cmb_font.currentIndexChanged.connect(self.on_font_changed)
+
+        grid.addWidget(self.cmb_font, 0, 1, 1, 2)
+
+        grid.addWidget(QtWidgets.QLabel("Size"), 0, 3)
+        self.spin_font_size = QtWidgets.QSpinBox()
+        self.spin_font_size.setRange(8, 64)
+        self.spin_font_size.setValue(12)
+        self.spin_font_size.valueChanged.connect(self.schedule_fast)
+        grid.addWidget(self.spin_font_size, 0, 4)
+        
+        grid.addWidget(QtWidgets.QLabel("TTC Index"), 1, 3)
+        self.spin_ttc = QtWidgets.QSpinBox()
+        self.spin_ttc.setRange(0, 16)
+        self.spin_ttc.setValue(0)
+        self.spin_ttc.valueChanged.connect(self.on_ttc_changed)
+        grid.addWidget(self.spin_ttc, 1, 4)
+
+        self.controls_layout.addWidget(self.g_font)
+
+        # ASCII charset
+        self.g_charset = QtWidgets.QGroupBox("ASCII Charset (ASCII/Overlay)")
+        grid = QtWidgets.QGridLayout(self.g_charset)
+
+        self.rb_preset = QtWidgets.QRadioButton("Preset")
+        self.rb_custom = QtWidgets.QRadioButton("Custom")
+        self.rb_preset.setChecked(True)
+        self.rb_preset.toggled.connect(self.schedule_fast)
+        grid.addWidget(self.rb_preset, 0, 0)
+        grid.addWidget(self.rb_custom, 0, 1)
+
+        self.cmb_charset = QtWidgets.QComboBox()
+        self.cmb_charset.addItems(list(PRESET_CHARSETS.keys()))
+        self.cmb_charset.currentIndexChanged.connect(self.schedule_fast)
+        grid.addWidget(self.cmb_charset, 0, 2)
+
+        self.edit_charset = QtWidgets.QLineEdit()
+        self.edit_charset.setPlaceholderText("@%#*+=-:. ")
+        self.edit_charset.textChanged.connect(self.schedule_fast)
+        grid.addWidget(self.edit_charset, 1, 0, 1, 3)
+
+        self.controls_layout.addWidget(self.g_charset)
+
+        # Edge settings
+        self.g_edges = QtWidgets.QGroupBox("Pixel Edges (Pixel Edges / Overlay)")
+        grid = QtWidgets.QGridLayout(self.g_edges)
+
+        grid.addWidget(QtWidgets.QLabel("Threshold"), 0, 0)
+        self.spin_edge_thresh = QtWidgets.QSpinBox()
+        self.spin_edge_thresh.setRange(0, 255)
+        self.spin_edge_thresh.setValue(70)
+        self.spin_edge_thresh.valueChanged.connect(self.schedule_fast)
+        grid.addWidget(self.spin_edge_thresh, 0, 1)
+
+        grid.addWidget(QtWidgets.QLabel("Pixel size"), 0, 2)
+        self.spin_edge_pix = QtWidgets.QSpinBox()
+        self.spin_edge_pix.setRange(1, 40)
+        self.spin_edge_pix.setValue(6)
+        self.spin_edge_pix.valueChanged.connect(self.schedule_fast)
+        grid.addWidget(self.spin_edge_pix, 0, 3)
+
+        grid.addWidget(QtWidgets.QLabel("Thickness"), 1, 0)
+        self.spin_edge_thick = QtWidgets.QSpinBox()
+        self.spin_edge_thick.setRange(0, 10)
+        self.spin_edge_thick.setValue(2)
+        self.spin_edge_thick.valueChanged.connect(self.schedule_fast)
+        grid.addWidget(self.spin_edge_thick, 1, 1)
+
+        self.chk_edge_invert = QtWidgets.QCheckBox("Invert edges")
+        self.chk_edge_invert.stateChanged.connect(self.schedule_fast)
+        grid.addWidget(self.chk_edge_invert, 1, 2, 1, 2)
+
+        grid.addWidget(QtWidgets.QLabel("Edge char"), 2, 0)
+        self.edit_edge_char = QtWidgets.QLineEdit("█")
+        self.edit_edge_char.setMaxLength(2)
+        self.edit_edge_char.textChanged.connect(self.schedule_fast)
+        grid.addWidget(self.edit_edge_char, 2, 1)
+
+        grid.addWidget(QtWidgets.QLabel("Edge FG"), 2, 2)
+        self.cmb_edge_fg = QtWidgets.QComboBox()
+        self.cmb_edge_fg.addItems(EDGE_FG_MODES)
+        self.cmb_edge_fg.setCurrentText("Black")
+        self.cmb_edge_fg.currentIndexChanged.connect(self.schedule_fast)
+        grid.addWidget(self.cmb_edge_fg, 2, 3)
+
+        grid.addWidget(QtWidgets.QLabel("Edge BG (Pixel Edges only)"), 3, 0, 1, 2)
+        self.cmb_edge_bg = QtWidgets.QComboBox()
+        self.cmb_edge_bg.addItems(EDGE_BG_MODES)
+        self.cmb_edge_bg.setCurrentText("White")
+        self.cmb_edge_bg.currentIndexChanged.connect(self.schedule_fast)
+        grid.addWidget(self.cmb_edge_bg, 3, 2, 1, 2)
+
+        self.controls_layout.addWidget(self.g_edges)
+
+        # ✅ Semantics: manage labels (THIS WAS MISSING)
+        self.g_sem = QtWidgets.QGroupBox("Semantics: manage labels (replace / delete / hide all except)")
+        v = QtWidgets.QVBoxLayout(self.g_sem)
+
+        row = QtWidgets.QHBoxLayout()
+        self.btn_detect = QtWidgets.QPushButton("Detect labels")
+        self.btn_detect.clicked.connect(self.detect_labels)
+        row.addWidget(self.btn_detect)
+
+        self.btn_hide_all_except = QtWidgets.QPushButton("Hide all except selected")
+        self.btn_hide_all_except.clicked.connect(self.hide_all_except_selected)
+        row.addWidget(self.btn_hide_all_except)
+
+        self.btn_unhide_all = QtWidgets.QPushButton("Unhide all")
+        self.btn_unhide_all.clicked.connect(self.unhide_all)
+        row.addWidget(self.btn_unhide_all)
+
+        self.btn_import = QtWidgets.QPushButton("Import JSON")
+        self.btn_import.clicked.connect(self.import_json)
+        row.addWidget(self.btn_import)
+
+        self.btn_export = QtWidgets.QPushButton("Export JSON")
+        self.btn_export.clicked.connect(self.export_json)
+        row.addWidget(self.btn_export)
+
+        row.addStretch(1)
+        v.addLayout(row)
+
+        row2 = QtWidgets.QHBoxLayout()
+        self.edit_add_label = QtWidgets.QLineEdit()
+        self.edit_add_label.setPlaceholderText("label (e.g., tree)")
+        row2.addWidget(self.edit_add_label)
+
+        self.edit_add_phrase = QtWidgets.QLineEdit()
+        self.edit_add_phrase.setPlaceholderText("replacement (e.g., cherry blossom) OR sequence: t r e")
+        row2.addWidget(self.edit_add_phrase)
+
+        self.chk_add_hide = QtWidgets.QCheckBox("Hide")
+        row2.addWidget(self.chk_add_hide)
+
+        self.btn_add_row = QtWidgets.QPushButton("Add/Update")
+        self.btn_add_row.clicked.connect(self.add_update_mapping)
+        row2.addWidget(self.btn_add_row)
+
+        self.btn_remove = QtWidgets.QPushButton("Remove selected")
+        self.btn_remove.clicked.connect(self.remove_selected_mappings)
+        row2.addWidget(self.btn_remove)
+
+        v.addLayout(row2)
+
+        self.lbl_sem_status = QtWidgets.QLabel("—")
+        self.lbl_sem_status.setWordWrap(True)
+        v.addWidget(self.lbl_sem_status)
+
+        self.table_sem = QtWidgets.QTableWidget(0, 3)
+        self.table_sem.setHorizontalHeaderLabels(["Label", "Replacement phrase", "Hide"])
+        self.table_sem.setColumnWidth(2, 70)
+        self.table_sem.horizontalHeader().setStretchLastSection(True)
+        self.table_sem.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table_sem.setEditTriggers(QtWidgets.QAbstractItemView.DoubleClicked | QtWidgets.QAbstractItemView.EditKeyPressed)
+        self.table_sem.itemChanged.connect(self.on_table_changed)
+        v.addWidget(self.table_sem)
+
+        hint = QtWidgets.QLabel(
+            "Delete vs Replace:\n"
+            "- Replace: set a phrase; region uses characters from phrase.\n"
+            "- Delete: check Hide => region becomes spaces.\n"
+            "Tip: blank replacement means 'use label itself'."
+        )
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+
+        self.controls_layout.addWidget(self.g_sem)
+
+        # Adjustments
+        self.g_adj = QtWidgets.QGroupBox("Adjustments (double-click slider = reset)")
+        grid = QtWidgets.QGridLayout(self.g_adj)
+        self.sliders: Dict[str, QtWidgets.QSlider] = {}
+
+        def add_slider(row, name):
+            lbl = QtWidgets.QLabel(name)
+            val = QtWidgets.QLabel("0")
+            val.setFixedWidth(30)
+            val.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+
+            s = DoubleClickResetSlider(QtCore.Qt.Horizontal)
+            s.setRange(-100, 100)
+            s.setValue(0)
+
+            s.sliderPressed.connect(self.on_slider_pressed)
+            s.sliderReleased.connect(self.on_slider_released)
+
+            def on_change(v):
+                val.setText(str(v))
+                self.schedule_fast()
+
+            s.valueChanged.connect(on_change)
+
+            grid.addWidget(lbl, row, 0)
+            grid.addWidget(s, row, 1, 1, 3)
+            grid.addWidget(val, row, 4)
+            self.sliders[name] = s
+
+        for i, nm in enumerate(["Brightness", "Contrast", "Ambiance", "Saturation", "Highlights", "Shadows"]):
+            add_slider(i, nm)
+
+        btn_reset_all = QtWidgets.QPushButton("Reset All Adjustments")
+        btn_reset_all.clicked.connect(self.reset_all_adjustments)
+        grid.addWidget(btn_reset_all, 6, 0, 1, 5)
+
+        self.controls_layout.addWidget(self.g_adj)
+        self.controls_layout.addStretch(1)
+
+        self.on_content_changed()
+
+    def set_controls_enabled(self, enabled: bool):
+        for g in [self.g_render, self.g_font, self.g_charset, self.g_edges, self.g_sem, self.g_adj]:
+            g.setEnabled(enabled)
+
+    # ----------------------------
+    # Events + render pipeline
+    # ----------------------------
+    def on_slider_pressed(self):
+        self.is_dragging = True
+
+    def on_slider_released(self):
+        self.is_dragging = False
+        self.dispatch_render(allow_kmeans=True)
+
+    def reset_all_adjustments(self):
+        for s in self.sliders.values():
+            s.setValue(0)
+        self.schedule_fast()
+
+    def on_ttc_changed(self):
+            # Re-check current font under the new TTC index
+            self.on_font_changed()
+    
+    def on_font_changed(self):
+        """
+        Guard against proportional fonts:
+        - Warn once per font
+        - Auto-revert to Consolas to avoid distorted renders
+        """
+        if not self.font_files:
+            self.schedule_fast()
+            return
+
+        label = self.cmb_font.currentText()
+        font_path = self.font_map.get(label, "")
+
+        # If we can't inspect it, allow it (best-effort)
+        if not font_path or not os.path.exists(font_path):
+            self.schedule_fast()
+            return
+
+        # Check monospace (use current TTC index)
+        ttc_index = int(getattr(self, "spin_ttc", None).value()) if hasattr(self, "spin_ttc") else 0
+        is_mono = is_monospace_font_file(font_path, size=16, ttc_index=ttc_index)
+
+        if is_mono:
+            self.status.showMessage(f"Font set: {label}")
+            self.schedule_fast()
+            return
+
+        # Non-mono: warn once and revert
+        if label.lower() not in self._warned_nonmono_fonts:
+            self._warned_nonmono_fonts.add(label.lower())
+            QtWidgets.QMessageBox.information(
+                self,
+                "Non-monospace font",
+                f"'{label}' is a proportional font.\n\n"
+                "This app renders on a fixed character grid, so proportional fonts will distort the image.\n\n"
+                "Switching back to Consolas (monospace)."
+            )
+
+        # revert to Consolas if we have it
+        if self._consolas_index is not None:
+            self.cmb_font.blockSignals(True)
+            self.cmb_font.setCurrentIndex(self._consolas_index)
+            self.cmb_font.blockSignals(False)
+
+        self.status.showMessage("Reverted to Consolas to preserve shape.")
+        self.schedule_fast()
+    
+    def on_content_changed(self):
+        mode = self.cmb_content.currentText()
+
+        is_ascii_like = mode in ("ASCII", "Edge Overlay")
+        is_edges = mode in ("Pixel Edges", "Edge Overlay")
+        is_edges_only = (mode == "Pixel Edges")
+        is_sem = (mode == "Semantic Letters")
+
+        self.g_charset.setEnabled(is_ascii_like)
+        self.chk_invert.setEnabled(is_ascii_like)
+
+        self.g_edges.setEnabled(is_edges)
+
+        self.cmb_color.setEnabled(not is_edges_only)
+        self.spin_k.setEnabled(not is_edges_only)
+
+        self.cmb_fill.setEnabled(is_sem and SEMANTIC_AVAILABLE)
+        self.spin_seed.setEnabled(is_sem and SEMANTIC_AVAILABLE)
+
+        # ✅ show semantics manager only in Semantic Letters mode
+        self.g_sem.setEnabled(is_sem and SEMANTIC_AVAILABLE)
+
+        self.schedule_fast()
+
+    def open_image(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open Image", "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp *.tiff);;All Files (*.*)"
+        )
+        if not path:
+            return
+        try:
+            img = Image.open(path).convert("RGB")
+            self.base_img = downscale_for_processing(img, PROCESS_MAX_SIDE)
+
+            # reset semantic caches + mappings
+            self.seg_small = None
+            self.seg_lut = None
+            self.label_map = {}
+            self.hidden_labels = set()
+
+            # clear table
+            if hasattr(self, "table_sem"):
+                self.table_sem.blockSignals(True)
+                self.table_sem.setRowCount(0)
+                self.table_sem.blockSignals(False)
+            if hasattr(self, "lbl_sem_status"):
+                self.lbl_sem_status.setText("—")
+
+            self.image_view.set_image(pil_to_qimage(self.base_img))
+            self.render_view.set_image(None)
+            self.output_text.setPlainText("")
+
+            self.set_controls_enabled(True)
+            self.status.showMessage(
+                f"Loaded: {os.path.basename(path)} | processing={self.base_img.size[0]}×{self.base_img.size[1]}"
+            )
+            self.schedule_fast()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Open error", str(e))
+
+    def copy_latest_text(self):
+        if not self.last_result:
+            return
+        QtWidgets.QApplication.clipboard().setText("\n".join(self.last_result.lines))
+        self.status.showMessage("Copied latest text.")
+
+    def save_latest_txt(self):
+        if not self.last_result:
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save .txt", "output.txt", "Text (*.txt)")
+        if not path:
+            return
+        if not path.lower().endswith(".txt"):
+            path += ".txt"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(self.last_result.lines))
+        self.status.showMessage(f"Saved: {os.path.basename(path)}")
+
+    def schedule_fast(self):
+        if self.base_img is None:
+            return
+        self.fast_timer.start(FAST_DEBOUNCE_MS)
+
+    def dispatch_fast(self):
+        allow_kmeans = (self.cmb_color.currentText() != "Color (K-means)")
+        self.dispatch_render(allow_kmeans=allow_kmeans)
+        if self.cmb_color.currentText() == "Color (K-means)":
+            self.kmeans_timer.start(KMEANS_DEBOUNCE_MS)
+
+    def dispatch_kmeans(self):
+        self.dispatch_render(allow_kmeans=True)
+
+    def current_charset(self) -> str:
+        if self.rb_custom.isChecked():
+            cs = self.edit_charset.text()
+            return cs if len(cs) >= 2 else PRESET_CHARSETS["Standard"]
+        return PRESET_CHARSETS[self.cmb_charset.currentText()]
+
+    def current_font_path(self) -> str:
+        return self.font_map.get(self.cmb_font.currentText(), "")
+
+    def selected_font_family(self) -> str:
+        path = self.current_font_path()
+        if not path:
+            return "Consolas"
+        if path in self._font_family_cache:
+            return self._font_family_cache[path]
+        fam = "Consolas"
+        try:
+            fid = QtGui.QFontDatabase.addApplicationFont(path)
+            families = QtGui.QFontDatabase.applicationFontFamilies(fid)
+            if families:
+                fam = families[0]
+        except Exception:
+            pass
+        self._font_family_cache[path] = fam
+        return fam
+
+    def dispatch_render(self, allow_kmeans: bool):
+        if self.base_img is None:
+            return
+
+        mode = self.cmb_content.currentText()
+        if mode == "Semantic Letters" and not SEMANTIC_AVAILABLE:
+            self.cmb_content.setCurrentText("ASCII")
+            mode = "ASCII"
+
+        self.request_id += 1
+        rid = self.request_id
+
+        use_cap = bool(self.chk_preview_cap.isChecked()) and self.is_dragging
+
+        params = RenderParams(
+            content_mode=mode,
+            fill_style=self.cmb_fill.currentText(),
+            seed=int(self.spin_seed.value()),
+
+            width_chars=int(self.spin_width.value()),
+            use_preview_cap=use_cap,
+            preview_cap=int(self.spin_preview_cap.value()),
+
+            invert=bool(self.chk_invert.isChecked()),
+            charset=self.current_charset(),
+
+            brightness=int(self.sliders["Brightness"].value()),
+            contrast=int(self.sliders["Contrast"].value()),
+            ambiance=int(self.sliders["Ambiance"].value()),
+            saturation=int(self.sliders["Saturation"].value()),
+            highlights=int(self.sliders["Highlights"].value()),
+            shadows=int(self.sliders["Shadows"].value()),
+
+            font_path=self.current_font_path(),
+            font_size=int(self.spin_font_size.value()),
+            ttc_index=int(self.spin_ttc.value()),
+
+            color_mode=self.cmb_color.currentText(),
+            k=int(self.spin_k.value()),
+            allow_kmeans=allow_kmeans,
+
+            transparent_bg=bool(self.chk_transparent.isChecked()),
+
+            seg_small=self.seg_small,
+            seg_lut=self.seg_lut,
+
+            label_map=dict(self.label_map),
+            hidden_labels=sorted(self.hidden_labels),
+
+            edge_threshold=int(self.spin_edge_thresh.value()),
+            edge_pixel_size=int(self.spin_edge_pix.value()),
+            edge_thickness=int(self.spin_edge_thick.value()),
+            edge_invert=bool(self.chk_edge_invert.isChecked()),
+            edge_char=str(self.edit_edge_char.text() or "█"),
+            edge_bg=str(self.cmb_edge_bg.currentText()),
+            edge_fg=str(self.cmb_edge_fg.currentText()),
+        )
+
+        worker = RenderWorker(rid, self.base_img, params)
+        worker.signals.result.connect(self.on_worker_result)
+        worker.signals.error.connect(self.on_worker_error)
+        self._active_workers[rid] = worker
+
+        self.thread_pool.start(worker)
+        self.status.showMessage("Rendering…")
+
+    @QtCore.Slot(int, object)
+    def on_worker_result(self, rid: int, result: RenderResult):
+        self._active_workers.pop(rid, None)
+        if rid < self.last_applied_id:
+            return
+        self.last_applied_id = rid
+        self.last_result = result
+
+        # keep semantic caches warm
+        if result.seg_small is not None and result.seg_lut is not None:
+            self.seg_small = result.seg_small
+            self.seg_lut = result.seg_lut
+
+        self.image_view.set_image(result.preview_qimage)
+        self.render_view.set_image(result.render_qimage)
+
+        if self.chk_live_text.isChecked():
+            self.output_text.blockSignals(True)
+            self.output_text.setPlainText("\n".join(result.lines))
+            self.output_text.blockSignals(False)
+
+        fontfile = os.path.basename(result.font_path) if result.font_path else "default"
+        self.status.showMessage(f"{result.content_mode} | font={fontfile} size={result.font_size} idx={result.ttc_index}")
+
+    @QtCore.Slot(int, str)
+    def on_worker_error(self, rid: int, msg: str):
+        self._active_workers.pop(rid, None)
+        print(msg)
+        self.status.showMessage("Render error (see console).")
+        if "Semantic" in msg or "torch" in msg or "transformers" in msg:
+            QtWidgets.QMessageBox.information(self, "Semantic error", msg)
+
+    # ----------------------------
+    # Export
+    # ----------------------------
+    def _build_export_render_full(self, force_kmeans=True):
+        if self.base_img is None:
+            raise RuntimeError("No image loaded.")
+
+        font = safe_load_pil_font(self.current_font_path(), int(self.spin_font_size.value()), int(self.spin_ttc.value()))
+        char_w, char_h = measure_char_cell(font)
+
+        adjusted = apply_adjustments(
+            self.base_img,
+            int(self.sliders["Brightness"].value()),
+            int(self.sliders["Contrast"].value()),
+            int(self.sliders["Ambiance"].value()),
+            int(self.sliders["Saturation"].value()),
+            int(self.sliders["Highlights"].value()),
+            int(self.sliders["Shadows"].value())
+        )
+
+        out_w = int(self.spin_width.value())
+        iw, ih = adjusted.size
+        out_h = max(1, int(round((ih / iw) * out_w * (char_w / char_h))))
+
+        mode = self.cmb_content.currentText()
+        cmode = self.cmb_color.currentText()
+
+        bg_rgb = (15, 15, 15)
+        fg_rgb = (230, 230, 230)
+
+        color_map = None
+        lines: List[str] = []
+
+        if mode == "ASCII":
+            lines, rgb_r, _ = make_ascii_lines(adjusted, out_w, self.current_charset(), bool(self.chk_invert.isChecked()), char_w, char_h)
+            if cmode == "Color (Direct)":
+                color_map = build_color_map(rgb_r, "Color (Direct)", int(self.spin_k.value()))
+            elif cmode == "Color (K-means)":
+                color_map = build_color_map(rgb_r, "Color (K-means)" if force_kmeans else "Color (Direct)", int(self.spin_k.value()))
+            else:
+                color_map = None
+
+        elif mode == "Pixel Edges":
+            mask = make_pixel_edge_mask(
+                adjusted, out_w, out_h,
+                pixel_size=int(self.spin_edge_pix.value()),
+                threshold=int(self.spin_edge_thresh.value()),
+                thickness=int(self.spin_edge_thick.value()),
+                invert=bool(self.chk_edge_invert.isChecked())
+            )
+            lines = edge_mask_to_lines(mask, str(self.edit_edge_char.text() or "█"))
+            fg_rgb = (0, 0, 0) if self.cmb_edge_fg.currentText() == "Black" else (235, 235, 235)
+            bg_rgb = (255, 255, 255) if self.cmb_edge_bg.currentText() == "White" else (15, 15, 15)
+            color_map = None
+
+        elif mode == "Edge Overlay":
+            base_lines, rgb_r, _ = make_ascii_lines(adjusted, out_w, self.current_charset(), bool(self.chk_invert.isChecked()), char_w, char_h)
+            if cmode == "Mono":
+                base_cm = np.zeros((len(base_lines), max(len(l) for l in base_lines), 3), dtype=np.uint8)
+                base_cm[:, :, :] = np.array([230, 230, 230], dtype=np.uint8)
+            elif cmode == "Color (Direct)":
+                base_cm = build_color_map(rgb_r, "Color (Direct)", int(self.spin_k.value()))
+            else:
+                base_cm = build_color_map(rgb_r, "Color (K-means)" if force_kmeans else "Color (Direct)", int(self.spin_k.value()))
+
+            mask = make_pixel_edge_mask(
+                adjusted, out_w, len(base_lines),
+                pixel_size=int(self.spin_edge_pix.value()),
+                threshold=int(self.spin_edge_thresh.value()),
+                thickness=int(self.spin_edge_thick.value()),
+                invert=bool(self.chk_edge_invert.isChecked())
+            )
+            lines = overlay_edges_on_lines(base_lines, mask, str(self.edit_edge_char.text() or "█"))
+            edge_rgb = (0, 0, 0) if self.cmb_edge_fg.currentText() == "Black" else (235, 235, 235)
+            m = np.asarray(mask.resize((base_cm.shape[1], base_cm.shape[0]), Image.Resampling.NEAREST), dtype=np.uint8)
+            color_map = base_cm.copy()
+            color_map[m > 0] = np.array(edge_rgb, dtype=np.uint8)
+
+        else:
+            # Semantic Letters export = same logic as worker (with label_map + hide)
+            if not SEMANTIC_AVAILABLE:
+                raise RuntimeError("Semantic mode not available in this build/environment.")
+
+            if self.seg_small is None or self.seg_lut is None:
+                self.seg_small, self.seg_lut = compute_seg_small(self.base_img)
+
+            ids_grid = seg_to_ids_grid(self.seg_small, out_w, out_h)
+            lut = list(self.seg_lut)
+            max_id = int(ids_grid.max())
+            if max_id >= len(lut):
+                lut = lut + ["object"] * (max_id + 1 - len(lut))
+
+            hidden_set = set(self.hidden_labels)
+
+            def phrase_to_char_pool(phrase: str) -> List[str]:
+                phrase = (phrase or "").strip()
+                if not phrase:
+                    return ["o"]
+                if "," in phrase:
+                    parts = [p.strip() for p in phrase.split(",") if p.strip()]
+                else:
+                    parts = [p for p in phrase.split() if p]
+                if len(parts) >= 2 and all(len(p) <= 3 for p in parts):
+                    seq = []
+                    for p in parts:
+                        ch = p[0]
+                        if ch == "_":
+                            ch = " "
+                        seq.append(ch)
+                    return seq if seq else ["o"]
+                s = phrase.replace(" ", "")
+                return [c for c in s] if s else ["o"]
+
+            def _splitmix64(z: int) -> int:
+                z = (z + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9 & 0xFFFFFFFFFFFFFFFF
+                z = (z ^ (z >> 27)) * 0x94D049BB133111EB & 0xFFFFFFFFFFFFFFFF
+                z = z ^ (z >> 31)
+                return z & 0xFFFFFFFFFFFFFFFF
+
+            def pick_char_jumble(pool: List[str], x: int, y: int, cls_id: int, seed: int) -> str:
+                if not pool:
+                    return "o"
+                z = seed & 0xFFFFFFFFFFFFFFFF
+                z ^= (x * 0x1F123BB5) & 0xFFFFFFFFFFFFFFFF
+                z ^= (y * 0x9E3779B1) & 0xFFFFFFFFFFFFFFFF
+                z ^= (cls_id * 0xC2B2AE35) & 0xFFFFFFFFFFFFFFFF
+                h = _splitmix64(z)
+                return pool[h % len(pool)]
+
+            id_to_pool: Dict[int, List[str]] = {}
+            for cid in np.unique(ids_grid):
+                lbl = lut[int(cid)].strip().lower()
+                if lbl in hidden_set:
+                    id_to_pool[int(cid)] = [" "]
+                else:
+                    phrase = (self.label_map.get(lbl, "") or "").strip() or lbl
+                    id_to_pool[int(cid)] = phrase_to_char_pool(phrase)
+
+            seed = int(self.spin_seed.value()) & 0xFFFFFFFFFFFFFFFF
+            cycle = (self.cmb_fill.currentText() == "Cycle")
+
+            lines = []
+            for y in range(out_h):
+                row = []
+                row_ids = ids_grid[y]
+                for x in range(out_w):
+                    cid = int(row_ids[x])
+                    pool = id_to_pool.get(cid) or ["o"]
+                    if cycle:
+                        idx = (x + y * 131 + cid * 17) % len(pool)
+                        ch = pool[idx]
+                    else:
+                        ch = pick_char_jumble(pool, x, y, cid, seed)
+                    row.append(ch[0] if ch else " ")
+                lines.append("".join(row))
+
+            resized_rgb = adjusted.resize((out_w, out_h), Image.Resampling.BILINEAR)
+            if cmode == "Color (Direct)":
+                color_map = build_color_map(resized_rgb, "Color (Direct)", int(self.spin_k.value()))
+            elif cmode == "Color (K-means)":
+                color_map = build_color_map(resized_rgb, "Color (K-means)" if force_kmeans else "Color (Direct)", int(self.spin_k.value()))
+            else:
+                color_map = None
+
+        pil_img = render_lines_to_rgba(lines, font, color_map, bool(self.chk_transparent.isChecked()), bg_rgb, fg_rgb)
+        return pil_img, lines, color_map, bg_rgb, fg_rgb
+
+    def export_png(self):
+        if self.base_img is None:
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export PNG", "render.png", "PNG (*.png)")
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        try:
+            pil_img, _, _, _, _ = self._build_export_render_full(force_kmeans=True)
+            pil_img.save(path, format="PNG")
+            self.status.showMessage(f"Exported: {os.path.basename(path)}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Export error", str(e))
+
+    def export_svg(self):
+        if self.base_img is None:
+            return
+
+        msg = QtWidgets.QMessageBox(self)
+        msg.setWindowTitle("Export SVG")
+        msg.setText("Choose SVG export mode:")
+        btn_text = msg.addButton("SVG (Text, editable)", QtWidgets.QMessageBox.AcceptRole)
+        btn_embed = msg.addButton("SVG (Embedded PNG, reliable)", QtWidgets.QMessageBox.AcceptRole)
+        msg.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+        msg.exec()
+
+        clicked = msg.clickedButton()
+        if clicked is None or clicked.text() == "Cancel":
+            return
+        as_text = (clicked == btn_text)
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export SVG", "render.svg", "SVG (*.svg)")
+        if not path:
+            return
+        if not path.lower().endswith(".svg"):
+            path += ".svg"
+
+        try:
+            pil_img, lines, color_map, bg_rgb, fg_rgb = self._build_export_render_full(force_kmeans=True)
+            transparent_bg = bool(self.chk_transparent.isChecked())
+
+            if not as_text:
+                svg = svg_embed_png(pil_img, transparent_bg=transparent_bg, bg_rgb=bg_rgb)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(svg)
+                self.status.showMessage(f"Exported: {os.path.basename(path)}")
+                return
+
+            font_family = self.selected_font_family()
+            font_size = int(self.spin_font_size.value())
+            qfont = QtGui.QFont(font_family, font_size)
+            metrics = QtGui.QFontMetrics(qfont)
+            char_w = max(1, metrics.horizontalAdvance("M"))
+            line_h = max(1, metrics.height())
+
+            svg = svg_text_export(
+                lines=lines,
+                color_map=color_map,
+                font_family=font_family,
+                font_size_px=font_size,
+                char_w=char_w,
+                line_h=line_h,
+                transparent_bg=transparent_bg,
+                bg_rgb=bg_rgb,
+                default_fg_rgb=fg_rgb
+            )
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(svg)
+            self.status.showMessage(f"Exported: {os.path.basename(path)}")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Export error", str(e))
