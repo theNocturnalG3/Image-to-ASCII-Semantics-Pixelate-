@@ -52,11 +52,11 @@ Built as a GUI desktop application (Python).
 ## Demo / Screenshots
 
 ![UI](examples/UI_1.gif)
-![1](xamples/BOA_0.png)
-![1](xamples/BOA_1.png)
-![2](xamples/BOA_2.png)
-![3](xamples/BOA_3.png)
-![4](xamples/BOA_4.png)
+![0](examples/BOA_0.png)
+![1](examples/BOA_1.png)
+![2](examples/BOA_2.png)
+![3](examples/BOA_3.png)
+![4](examples/BOA_4.png)
 ![Semantic Letters](examples/BOA_humanx0110.png)
 
 ---
