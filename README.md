@@ -172,3 +172,11 @@ MIT — see `LICENSE`.
 - UI: PySide6
 - Image processing: Pillow, NumPy
 - Semantic segmentation: Hugging Face Transformers (SegFormer-family models)
+
+---
+
+## Upcoming updates
+- Selecting output size
+- In-app zoom
+- Use of non-mono-space fonts
+- SVG expert fix
